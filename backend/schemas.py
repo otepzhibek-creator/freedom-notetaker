@@ -40,6 +40,7 @@ class MeetingOut(BaseModel):
     duration_seconds: Optional[float] = None
     segments: List[TranscriptSegmentOut] = []
     analysis: Optional[MeetingAnalysisOut] = None
+    speaker_names: Optional[str] = '{}'
 
     class Config:
         from_attributes = True

@@ -26,6 +26,7 @@ export interface Meeting {
   duration_seconds: number | null
   segments: TranscriptSegment[]
   analysis: MeetingAnalysis | null
+  speaker_names: string | null  // JSON: {"SPEAKER_00": "Бейбит"}
 }
 
 export interface MeetingListItem {
@@ -71,6 +72,18 @@ export const api = {
     }),
   analyzeMeeting: (id: string) =>
     req<{ ok: boolean }>(`/meetings/${id}/analyze`, { method: 'POST' }),
+  updateSpeakers: (id: string, names: Record<string, string>) =>
+    req<{ ok: boolean }>(`/meetings/${id}/speakers`, {
+      method: 'PATCH',
+      body: JSON.stringify({ names }),
+    }),
+  startMeetBot: (url: string, title: string, botName?: string) =>
+    req<{ meeting_id: string; status: string }>('/meet/start', {
+      method: 'POST',
+      body: JSON.stringify({ url, title, bot_name: botName || 'Freedom Notetaker' }),
+    }),
+  stopMeetBot: (meetingId: string) =>
+    req<{ ok: boolean }>(`/meet/${meetingId}/stop`, { method: 'POST' }),
 
   uploadFile: async (
     file: File,

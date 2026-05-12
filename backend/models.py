@@ -24,6 +24,7 @@ class Meeting(Base):
     finished_at = Column(DateTime, nullable=True)
     audio_path = Column(String, nullable=True)
     duration_seconds = Column(Float, nullable=True)
+    speaker_names = Column(Text, nullable=True, default='{}')
 
     segments = relationship("TranscriptSegment", back_populates="meeting", cascade="all, delete-orphan", order_by="TranscriptSegment.start_time")
     analysis = relationship("MeetingAnalysis", back_populates="meeting", uselist=False, cascade="all, delete-orphan")

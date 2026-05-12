@@ -1,9 +1,9 @@
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { useState } from 'react'
+import { useState, useRef } from 'react'
 import {
   ArrowLeft, Sparkles, Clock, Users, ListChecks, Lightbulb,
-  CheckSquare, Loader2, Edit2, Check, X, RefreshCw,
+  CheckSquare, Loader2, Edit2, Check, X, RefreshCw, UserCircle,
 } from 'lucide-react'
 import { api, Meeting, formatDuration, formatTime, speakerColor } from '../api/client'
 import clsx from 'clsx'
@@ -36,6 +36,24 @@ export default function MeetingDetailPage() {
     setEditTitle(false)
   }
 
+  // Speaker name editing
+  const speakerNames: Record<string, string> = tryParse(meeting?.speaker_names, {})
+  const [editingSpeaker, setEditingSpeaker] = useState<string | null>(null)
+  const [speakerInput, setSpeakerInput] = useState('')
+  const speakerInputRef = useRef<HTMLInputElement>(null)
+
+  const saveSpeakerName = async (speakerId: string, name: string) => {
+    const updated = { ...speakerNames, [speakerId]: name.trim() || speakerId }
+    await api.updateSpeakers(id!, updated)
+    qc.invalidateQueries({ queryKey: ['meeting', id] })
+    setEditingSpeaker(null)
+  }
+
+  const displaySpeaker = (raw: string | null) => {
+    if (!raw) return null
+    return speakerNames[raw] || raw
+  }
+
   if (isLoading) return (
     <div className="flex justify-center py-20">
       <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-brand-500" />
@@ -44,6 +62,9 @@ export default function MeetingDetailPage() {
   if (!meeting) return <div className="text-center py-20 text-gray-500">Встреча не найдена</div>
 
   const isProcessing = meeting.status === 'recording' || meeting.status === 'processing'
+
+  // Collect unique speakers from segments
+  const uniqueSpeakers = [...new Set(meeting.segments.map(s => s.speaker).filter(Boolean))] as string[]
 
   return (
     <div className="max-w-4xl mx-auto">
@@ -129,14 +150,59 @@ export default function MeetingDetailPage() {
           {meeting.title.startsWith('Ошибка') && (
             <p className="text-sm text-red-700 mt-1 font-mono">{meeting.title}</p>
           )}
-          <p className="text-xs text-red-500 mt-2">Проверьте логи сервера для подробностей</p>
+        </div>
+      )}
+
+      {/* Speaker name editor — shown when diarization detected speakers */}
+      {uniqueSpeakers.length > 0 && (
+        <div className="bg-white rounded-xl border border-gray-200 p-4 mb-6">
+          <h3 className="flex items-center gap-2 text-sm font-semibold text-gray-700 mb-3">
+            <UserCircle size={15} className="text-brand-500" />
+            Участники — нажмите чтобы переименовать
+          </h3>
+          <div className="flex flex-wrap gap-2">
+            {uniqueSpeakers.map((spk) => (
+              <div key={spk}>
+                {editingSpeaker === spk ? (
+                  <div className="flex items-center gap-1">
+                    <input
+                      ref={speakerInputRef}
+                      autoFocus
+                      value={speakerInput}
+                      onChange={(e) => setSpeakerInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') saveSpeakerName(spk, speakerInput)
+                        if (e.key === 'Escape') setEditingSpeaker(null)
+                      }}
+                      placeholder={spk}
+                      className="border border-brand-400 rounded px-2 py-1 text-xs w-32 focus:outline-none focus:ring-1 focus:ring-brand-500"
+                    />
+                    <button onClick={() => saveSpeakerName(spk, speakerInput)} className="p-1 text-green-600 hover:bg-green-50 rounded">
+                      <Check size={13} />
+                    </button>
+                    <button onClick={() => setEditingSpeaker(null)} className="p-1 text-gray-400 hover:bg-gray-100 rounded">
+                      <X size={13} />
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    onClick={() => { setEditingSpeaker(spk); setSpeakerInput(speakerNames[spk] || '') }}
+                    className={`flex items-center gap-1 px-2.5 py-1 rounded text-xs font-medium ${speakerColor(spk)} hover:opacity-80 transition-opacity`}
+                  >
+                    <Edit2 size={10} />
+                    {speakerNames[spk] || spk}
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
         </div>
       )}
 
       <div className="grid grid-cols-1 lg:grid-cols-5 gap-6">
         {meeting.analysis && (
           <div className="lg:col-span-2 space-y-4">
-            <AnalysisPanel analysis={meeting.analysis} />
+            <AnalysisPanel analysis={meeting.analysis} speakerNames={speakerNames} />
           </div>
         )}
 
@@ -154,7 +220,7 @@ export default function MeetingDetailPage() {
                   <div className="flex-1">
                     {seg.speaker && (
                       <span className={`text-xs px-1.5 py-0.5 rounded font-medium mr-2 ${speakerColor(seg.speaker)}`}>
-                        {seg.speaker}
+                        {displaySpeaker(seg.speaker)}
                       </span>
                     )}
                     <span className="text-sm text-gray-900">{seg.text}</span>
@@ -169,7 +235,13 @@ export default function MeetingDetailPage() {
   )
 }
 
-function AnalysisPanel({ analysis }: { analysis: NonNullable<Meeting['analysis']> }) {
+function AnalysisPanel({
+  analysis,
+  speakerNames,
+}: {
+  analysis: NonNullable<Meeting['analysis']>
+  speakerNames: Record<string, string>
+}) {
   const topics = tryParse<string[]>(analysis.key_topics, [])
   const actions = tryParse<string[]>(analysis.action_items, [])
   const decisions = tryParse<string[]>(analysis.decisions, [])
@@ -224,7 +296,7 @@ function AnalysisPanel({ analysis }: { analysis: NonNullable<Meeting['analysis']
             {Object.entries(speakers).map(([key, val]) => (
               <div key={key} className="flex items-center justify-between text-sm">
                 <span className={`px-2 py-0.5 rounded text-xs font-medium ${speakerColor(key)}`}>
-                  {val?.name || key}
+                  {speakerNames[key] || val?.name || key}
                 </span>
                 {val?.talk_time && <span className="text-gray-500 text-xs">{val.talk_time}</span>}
               </div>

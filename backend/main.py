@@ -8,6 +8,7 @@ load_dotenv()
 from database import init_db
 from routers.meetings import router as meetings_router
 from routers.transcribe import router as transcribe_router
+from routers.meet import router as meet_router
 
 app = FastAPI(title="Freedom AI Notetaker", version="1.0.0")
 
@@ -22,6 +23,7 @@ app.add_middleware(
 
 app.include_router(meetings_router)
 app.include_router(transcribe_router)
+app.include_router(meet_router)
 
 
 @app.on_event("startup")

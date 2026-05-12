@@ -87,6 +87,23 @@ async def update_title(meeting_id: str, body: MeetingCreate, db: AsyncSession = 
     return {"ok": True}
 
 
+from pydantic import BaseModel as _BaseModel
+
+class SpeakerNamesBody(_BaseModel):
+    names: dict  # {"SPEAKER_00": "Бейбит", "SPEAKER_01": "Арчи"}
+
+@router.patch("/{meeting_id}/speakers")
+async def update_speakers(meeting_id: str, body: SpeakerNamesBody, db: AsyncSession = Depends(get_db)):
+    import json as _json
+    result = await db.execute(select(Meeting).where(Meeting.id == meeting_id))
+    meeting = result.scalar_one_or_none()
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+    meeting.speaker_names = _json.dumps(body.names, ensure_ascii=False)
+    await db.commit()
+    return {"ok": True}
+
+
 async def _run_analysis(meeting_id: str):
     from database import AsyncSessionLocal
     async with AsyncSessionLocal() as db:
