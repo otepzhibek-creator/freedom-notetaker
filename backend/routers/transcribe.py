@@ -24,16 +24,90 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 SUPPORTED_AUDIO = {".wav", ".mp3", ".ogg", ".flac", ".m4a", ".aac", ".webm"}
 SUPPORTED_VIDEO = {".mp4", ".mkv", ".avi", ".mov"}
+CHUNK_SECONDS = 300  # 5 minutes per chunk
 
 
-async def _extract_audio(video_path: str, out_path: str):
+async def _run_ffmpeg(*args) -> bool:
     proc = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-y", "-i", video_path,
-        "-vn", "-ar", "16000", "-ac", "1", "-f", "wav", out_path,
+        "ffmpeg", *args,
         stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        logger.error("ffmpeg error: %s", stderr.decode())
+    return proc.returncode == 0
+
+
+async def _get_duration(path: str) -> float:
+    proc = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "quiet", "-print_format", "json",
+        "-show_format", path,
+        stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
     )
-    await proc.wait()
+    stdout, _ = await proc.communicate()
+    try:
+        info = json.loads(stdout)
+        return float(info["format"]["duration"])
+    except Exception:
+        return 0.0
+
+
+async def _to_wav(src: str, dst: str) -> bool:
+    return await _run_ffmpeg(
+        "-y", "-i", src,
+        "-vn", "-ar", "16000", "-ac", "1", "-f", "wav", dst
+    )
+
+
+async def _split_audio(wav_path: str, out_dir: str, chunk_sec: int) -> list[tuple[str, float]]:
+    duration = await _get_duration(wav_path)
+    if duration == 0 or duration <= chunk_sec:
+        return [(wav_path, 0.0)]
+
+    chunks = []
+    start = 0.0
+    idx = 0
+    while start < duration:
+        chunk_path = os.path.join(out_dir, f"chunk_{idx:04d}.wav")
+        ok = await _run_ffmpeg(
+            "-y", "-i", wav_path,
+            "-ss", str(start), "-t", str(chunk_sec),
+            "-ar", "16000", "-ac", "1", chunk_path
+        )
+        if ok and os.path.exists(chunk_path):
+            chunks.append((chunk_path, start))
+        start += chunk_sec
+        idx += 1
+
+    return chunks if chunks else [(wav_path, 0.0)]
+
+
+async def _transcribe_chunked(wav_path: str, meeting_id: str) -> list[dict]:
+    out_dir = os.path.join(UPLOAD_DIR, f"{meeting_id}_chunks")
+    os.makedirs(out_dir, exist_ok=True)
+
+    try:
+        chunks = await _split_audio(wav_path, out_dir, CHUNK_SECONDS)
+        logger.info("Transcribing %d chunk(s) for meeting %s", len(chunks), meeting_id)
+
+        all_segments = []
+        for chunk_path, offset in chunks:
+            with open(chunk_path, "rb") as f:
+                audio_bytes = f.read()
+            result = await transcribe_file(audio_bytes, os.path.basename(chunk_path))
+            for seg in result.get("segments", []):
+                all_segments.append({
+                    "start": seg["start"] + offset,
+                    "end": seg["end"] + offset,
+                    "text": seg["text"],
+                    "confidence": seg.get("confidence"),
+                })
+        return all_segments
+    finally:
+        import shutil
+        shutil.rmtree(out_dir, ignore_errors=True)
 
 
 async def _process_upload(meeting_id: str, audio_path: str, run_diarization: bool):
@@ -43,21 +117,22 @@ async def _process_upload(meeting_id: str, audio_path: str, run_diarization: boo
         meeting = result.scalar_one_or_none()
         if not meeting:
             return
-
         try:
             meeting.status = MeetingStatus.processing
             await db.commit()
 
-            with open(audio_path, "rb") as f:
-                audio_bytes = f.read()
+            ext = os.path.splitext(audio_path)[1].lower()
+            if ext != ".wav":
+                wav_path = audio_path.rsplit(".", 1)[0] + ".wav"
+                await _to_wav(audio_path, wav_path)
+            else:
+                wav_path = audio_path
 
-            filename = os.path.basename(audio_path)
-            stt_result = await transcribe_file(audio_bytes, filename)
-            segments = stt_result.get("segments", [])
+            segments = await _transcribe_chunked(wav_path, meeting_id)
 
-            if run_diarization and segments:
+            if run_diarization and segments and os.path.exists(wav_path):
                 diar_segments = await asyncio.get_event_loop().run_in_executor(
-                    None, diarize, audio_path
+                    None, diarize, wav_path
                 )
                 segments = assign_speakers(segments, diar_segments)
 
@@ -71,14 +146,12 @@ async def _process_upload(meeting_id: str, audio_path: str, run_diarization: boo
                     confidence=seg.get("confidence"),
                 ))
 
-            if segments:
-                meeting.duration_seconds = max(s.get("end", 0.0) for s in segments)
-
+            meeting.duration_seconds = segments[-1]["end"] if segments else 0
             meeting.finished_at = datetime.now(timezone.utc)
             meeting.audio_path = audio_path
             await db.commit()
         except Exception as e:
-            logger.error("Upload processing failed: %s", e)
+            logger.error("Upload processing failed: %s", e, exc_info=True)
             meeting.status = MeetingStatus.error
             await db.commit()
             return
@@ -92,7 +165,7 @@ async def upload_transcribe(
     file: UploadFile = File(...),
     meeting_id: Optional[str] = Form(None),
     title: str = Form("Без названия"),
-    diarization: bool = Form(True),
+    diarization: bool = Form(False),
     db: AsyncSession = Depends(get_db),
 ):
     ext = os.path.splitext(file.filename or "")[1].lower()
@@ -115,13 +188,7 @@ async def upload_transcribe(
     with open(raw_path, "wb") as f:
         f.write(content)
 
-    if ext in SUPPORTED_VIDEO:
-        audio_path = os.path.join(UPLOAD_DIR, f"{meeting.id}.wav")
-        await _extract_audio(raw_path, audio_path)
-    else:
-        audio_path = raw_path
-
-    background_tasks.add_task(_process_upload, meeting.id, audio_path, diarization)
+    background_tasks.add_task(_process_upload, meeting.id, raw_path, diarization)
     return {"meeting_id": meeting.id, "status": "processing"}
 
 
@@ -154,8 +221,7 @@ async def ws_transcribe(websocket: WebSocket, meeting_id: str):
                     try:
                         data = await websocket.receive()
                         if "bytes" in data:
-                            chunk = data["bytes"]
-                            await freedom.send_audio(chunk)
+                            await freedom.send_audio(data["bytes"])
                             elapsed += 0.25
                         elif "text" in data:
                             msg = json.loads(data["text"])
@@ -167,19 +233,23 @@ async def ws_transcribe(websocket: WebSocket, meeting_id: str):
                         break
                     except Exception as e:
                         logger.warning("Audio forward error: %s", e)
+                        await freedom.finish()
                         break
 
             async def forward_results():
-                async for result in freedom.stream():
-                    msg_type = result.get("type")
-                    text = result.get("text", "").strip()
-                    await websocket.send_json(result)
+                async for res in freedom.stream():
+                    msg_type = res.get("type")
+                    text = res.get("text", "").strip()
+                    try:
+                        await websocket.send_json(res)
+                    except Exception:
+                        break
                     if msg_type == "final" and text:
                         async with AsyncSessionLocal() as db:
                             db.add(TranscriptSegment(
                                 meeting_id=meeting_id,
-                                start_time=result.get("start", 0.0),
-                                end_time=result.get("end", elapsed),
+                                start_time=max(0.0, elapsed - 10),
+                                end_time=elapsed,
                                 text=text,
                                 confidence=None,
                             ))
@@ -190,7 +260,7 @@ async def ws_transcribe(websocket: WebSocket, meeting_id: str):
     except WebSocketDisconnect:
         pass
     except Exception as e:
-        logger.error("WS transcribe error: %s", e)
+        logger.error("WS transcribe error: %s", e, exc_info=True)
         try:
             await websocket.send_json({"type": "error", "error": str(e)})
         except Exception:
@@ -198,9 +268,9 @@ async def ws_transcribe(websocket: WebSocket, meeting_id: str):
     finally:
         async with AsyncSessionLocal() as db:
             result = await db.execute(select(Meeting).where(Meeting.id == meeting_id))
-            meeting = result.scalar_one_or_none()
-            if meeting:
-                meeting.status = MeetingStatus.processing
-                meeting.finished_at = datetime.now(timezone.utc)
+            m = result.scalar_one_or_none()
+            if m:
+                m.status = MeetingStatus.processing
+                m.finished_at = datetime.now(timezone.utc)
                 await db.commit()
         asyncio.create_task(_run_analysis(meeting_id))

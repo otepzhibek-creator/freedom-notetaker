@@ -2,7 +2,6 @@ from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
-from datetime import datetime, timezone
 
 from database import get_db
 from models import Meeting, MeetingAnalysis, TranscriptSegment, MeetingStatus
@@ -21,7 +20,7 @@ def _with_relations():
 
 @router.post("", response_model=MeetingOut)
 async def create_meeting(body: MeetingCreate, db: AsyncSession = Depends(get_db)):
-    meeting = Meeting(title=body.title)
+    meeting = Meeting(title=body.title or "Без названия")
     db.add(meeting)
     await db.commit()
     result = await db.execute(_with_relations().where(Meeting.id == meeting.id))
@@ -37,17 +36,22 @@ async def list_meetings(db: AsyncSession = Depends(get_db)):
 
     items = []
     for m in meetings:
-        count_res = await db.execute(
-            select(func.count()).where(TranscriptSegment.meeting_id == m.id)
-        )
+        try:
+            count_res = await db.execute(
+                select(func.count()).where(TranscriptSegment.meeting_id == m.id)
+            )
+            segment_count = count_res.scalar() or 0
+        except Exception:
+            segment_count = 0
+
         items.append(MeetingListItem(
             id=m.id,
-            title=m.title,
+            title=m.title or "Без названия",
             status=m.status,
             created_at=m.created_at,
             finished_at=m.finished_at,
             duration_seconds=m.duration_seconds,
-            segment_count=count_res.scalar() or 0,
+            segment_count=segment_count,
         ))
     return items
 
@@ -78,7 +82,7 @@ async def update_title(meeting_id: str, body: MeetingCreate, db: AsyncSession = 
     meeting = result.scalar_one_or_none()
     if not meeting:
         raise HTTPException(status_code=404, detail="Meeting not found")
-    meeting.title = body.title
+    meeting.title = body.title or meeting.title
     await db.commit()
     return {"ok": True}
 
@@ -100,6 +104,11 @@ async def _run_analysis(meeting_id: str):
             {"start": s.start_time, "end": s.end_time, "text": s.text, "speaker": s.speaker}
             for s in segs_result.scalars().all()
         ]
+
+        if not segments:
+            meeting.status = MeetingStatus.done
+            await db.commit()
+            return
 
         analysis_data = await analyze_meeting(segments, meeting.title)
 
