@@ -107,11 +107,14 @@ class FreedomWSClient:
         await asyncio.wait_for(self.ready.wait(), timeout=timeout)
 
     async def send_audio(self, audio_bytes: bytes):
-        if self._ws and self._ws.open:
-            await self._ws.send(audio_bytes)
+        if self._ws:
+            try:
+                await self._ws.send(audio_bytes)
+            except Exception:
+                pass
 
     async def finish(self):
-        if self._ws and self._ws.open:
+        if self._ws:
             try:
                 await self._ws.send(json.dumps({"type": "stop"}))
             except Exception:
