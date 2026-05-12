@@ -1,7 +1,8 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Mic, Square, Loader2 } from 'lucide-react'
+import { Mic, Square, Loader2, Monitor } from 'lucide-react'
 import { api, formatTime, speakerColor } from '../api/client'
+import clsx from 'clsx'
 
 interface LiveSegment {
   id: string
@@ -12,11 +13,13 @@ interface LiveSegment {
 }
 
 type Phase = 'idle' | 'connecting' | 'recording' | 'stopping'
+type AudioSource = 'mic' | 'screen'
 
 export default function RealtimePage() {
   const navigate = useNavigate()
   const [title, setTitle] = useState('')
   const [phase, setPhase] = useState<Phase>('idle')
+  const [audioSource, setAudioSource] = useState<AudioSource>('mic')
   const [elapsed, setElapsed] = useState(0)
   const [segments, setSegments] = useState<LiveSegment[]>([])
   const [partialText, setPartialText] = useState('')
@@ -55,7 +58,23 @@ export default function RealtimePage() {
       const meeting = await api.createMeeting(title || 'Встреча без названия')
       meetingIdRef.current = meeting.id
 
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      let stream: MediaStream
+      if (audioSource === 'screen') {
+        // Capture audio from a browser tab (e.g. Google Meet)
+        const display = await (navigator.mediaDevices as any).getDisplayMedia({
+          video: { width: 1, height: 1 },
+          audio: { echoCancellation: false, noiseSuppression: false },
+        })
+        // Stop the video track — we only need audio
+        display.getVideoTracks().forEach((t: MediaStreamTrack) => t.stop())
+        if (!display.getAudioTracks().length) {
+          display.getTracks().forEach((t: MediaStreamTrack) => t.stop())
+          throw new Error('Аудио не выбрано. Убедитесь что включили "Поделиться звуком вкладки".')
+        }
+        stream = new MediaStream(display.getAudioTracks())
+      } else {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      }
       streamRef.current = stream
 
       setPhase('connecting')
@@ -167,9 +186,37 @@ export default function RealtimePage() {
         </div>
       ) : phase === 'idle' ? (
         <div className="bg-white rounded-2xl border border-gray-200 p-8 flex flex-col items-center gap-6">
-          <div className="w-20 h-20 rounded-full bg-brand-50 flex items-center justify-center">
-            <Mic size={36} className="text-brand-600" />
+          {/* Source selector */}
+          <div className="flex gap-2 bg-gray-100 rounded-xl p-1 w-full max-w-sm">
+            <button
+              onClick={() => setAudioSource('mic')}
+              className={clsx(
+                'flex-1 flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-medium transition-colors',
+                audioSource === 'mic' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700',
+              )}
+            >
+              <Mic size={15} /> Микрофон
+            </button>
+            <button
+              onClick={() => setAudioSource('screen')}
+              className={clsx(
+                'flex-1 flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-medium transition-colors',
+                audioSource === 'screen' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700',
+              )}
+            >
+              <Monitor size={15} /> Звук встречи
+            </button>
           </div>
+
+          {audioSource === 'screen' && (
+            <div className="w-full max-w-sm bg-blue-50 border border-blue-100 rounded-xl p-3 text-xs text-blue-700 space-y-1">
+              <p className="font-medium">Для Google Meet / Zoom / Teams:</p>
+              <p>1. Зайди в встречу в Chrome</p>
+              <p>2. Нажми "Начать запись" — браузер спросит чем поделиться</p>
+              <p>3. Выбери вкладку с Google Meet и включи <b>"Поделиться звуком вкладки"</b></p>
+            </div>
+          )}
+
           <div className="w-full max-w-sm">
             <label className="block text-sm font-medium text-gray-700 mb-1">Название встречи</label>
             <input
@@ -185,7 +232,8 @@ export default function RealtimePage() {
             onClick={startRecording}
             className="flex items-center gap-2 px-8 py-3 bg-brand-600 text-white rounded-xl hover:bg-brand-700 transition-colors font-semibold text-base"
           >
-            <Mic size={18} /> Начать запись
+            {audioSource === 'screen' ? <Monitor size={18} /> : <Mic size={18} />}
+            Начать запись
           </button>
         </div>
       ) : (
