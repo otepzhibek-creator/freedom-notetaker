@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, case
 from sqlalchemy.orm import selectinload
 
 from database import get_db
@@ -29,31 +29,31 @@ async def create_meeting(body: MeetingCreate, db: AsyncSession = Depends(get_db)
 
 @router.get("", response_model=list[MeetingListItem])
 async def list_meetings(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(
-        select(Meeting).order_by(Meeting.created_at.desc()).limit(100)
+    # Single query: join segment counts to avoid N+1
+    counts_sq = (
+        select(TranscriptSegment.meeting_id, func.count().label("cnt"))
+        .group_by(TranscriptSegment.meeting_id)
+        .subquery()
     )
-    meetings = result.scalars().all()
-
-    items = []
-    for m in meetings:
-        try:
-            count_res = await db.execute(
-                select(func.count()).where(TranscriptSegment.meeting_id == m.id)
-            )
-            segment_count = count_res.scalar() or 0
-        except Exception:
-            segment_count = 0
-
-        items.append(MeetingListItem(
+    result = await db.execute(
+        select(Meeting, func.coalesce(counts_sq.c.cnt, 0).label("segment_count"))
+        .outerjoin(counts_sq, Meeting.id == counts_sq.c.meeting_id)
+        .order_by(Meeting.created_at.desc())
+        .limit(100)
+    )
+    rows = result.all()
+    return [
+        MeetingListItem(
             id=m.id,
             title=m.title or "Без названия",
             status=m.status,
             created_at=m.created_at,
             finished_at=m.finished_at,
             duration_seconds=m.duration_seconds,
-            segment_count=segment_count,
-        ))
-    return items
+            segment_count=cnt,
+        )
+        for m, cnt in rows
+    ]
 
 
 @router.get("/{meeting_id}", response_model=MeetingOut)

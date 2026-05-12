@@ -11,17 +11,16 @@ interface LiveSegment {
   speaker: string | null
 }
 
+type Phase = 'idle' | 'connecting' | 'recording' | 'stopping'
+
 export default function RealtimePage() {
   const navigate = useNavigate()
   const [title, setTitle] = useState('')
-  const [meetingId, setMeetingId] = useState<string | null>(null)
-  const [recording, setRecording] = useState(false)
+  const [phase, setPhase] = useState<Phase>('idle')
   const [elapsed, setElapsed] = useState(0)
   const [segments, setSegments] = useState<LiveSegment[]>([])
   const [partialText, setPartialText] = useState('')
   const [error, setError] = useState<string | null>(null)
-  const [waitingReady, setWaitingReady] = useState(false)
-  const [stopping, setStopping] = useState(false)
 
   const wsRef = useRef<WebSocket | null>(null)
   const recorderRef = useRef<MediaRecorder | null>(null)
@@ -30,31 +29,36 @@ export default function RealtimePage() {
   const transcriptEndRef = useRef<HTMLDivElement>(null)
   const idxRef = useRef(0)
   const meetingIdRef = useRef<string | null>(null)
+  const intentionalStopRef = useRef(false)
 
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [segments, partialText])
 
-  useEffect(() => () => stopAll(), [])
-
-  const stopAll = useCallback(() => {
+  // Cleanup on unmount — only close WS if we haven't intentionally stopped
+  // (intentional stop lets WS close naturally so Freedom can finish)
+  useEffect(() => () => {
     if (timerRef.current) clearInterval(timerRef.current)
     recorderRef.current?.stop()
     streamRef.current?.getTracks().forEach((t) => t.stop())
-    wsRef.current?.close()
+    if (!intentionalStopRef.current) wsRef.current?.close()
   }, [])
-
-  // Keep meetingIdRef in sync so onclose closure always has the latest value
-  useEffect(() => { meetingIdRef.current = meetingId }, [meetingId])
 
   const startRecording = async () => {
     setError(null)
+    setSegments([])
+    setPartialText('')
+    idxRef.current = 0
+    intentionalStopRef.current = false
+
     try {
       const meeting = await api.createMeeting(title || 'Встреча без названия')
-      setMeetingId(meeting.id)
+      meetingIdRef.current = meeting.id
 
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
       streamRef.current = stream
+
+      setPhase('connecting')
 
       const ws = new WebSocket(`/ws/transcribe/${meeting.id}`)
       wsRef.current = ws
@@ -62,7 +66,7 @@ export default function RealtimePage() {
       ws.onmessage = (e) => {
         const msg = JSON.parse(e.data)
         if (msg.type === 'ready') {
-          setWaitingReady(false)
+          setPhase('recording')
           startMediaRecorder(stream, ws)
         } else if (msg.type === 'partial') {
           setPartialText(msg.text || '')
@@ -70,31 +74,44 @@ export default function RealtimePage() {
           setPartialText('')
           setSegments((prev) => [
             ...prev,
-            { id: String(idxRef.current++), text: msg.text, start: msg.start ?? elapsed, end: msg.end ?? elapsed, speaker: null },
+            {
+              id: String(idxRef.current++),
+              text: msg.text,
+              start: msg.start ?? 0,
+              end: msg.end ?? 0,
+              speaker: null,
+            },
           ])
         } else if (msg.type === 'error') {
-          setError(msg.error)
+          setError(msg.error || 'Ошибка Freedom Speech')
+          setPhase('idle')
+          stream.getTracks().forEach((t) => t.stop())
         }
       }
 
-      ws.onerror = () => setError('Ошибка соединения с сервером')
-      ws.onclose = () => {
-        // WS closed (Freedom finished processing) — navigate to results
-        recorderRef.current?.stop()
-        streamRef.current?.getTracks().forEach((t) => t.stop())
+      ws.onerror = () => {
+        setError('Ошибка соединения с сервером')
+        setPhase('idle')
+        stream.getTracks().forEach((t) => t.stop())
         if (timerRef.current) clearInterval(timerRef.current)
-        setStopping(false)
-        setRecording(false)
-        const id = meetingIdRef.current
-        if (id) navigate(`/meetings/${id}`)
       }
 
-      setWaitingReady(true)
-      setRecording(true)
+      ws.onclose = () => {
+        if (timerRef.current) clearInterval(timerRef.current)
+        recorderRef.current?.stop()
+        streamRef.current?.getTracks().forEach((t) => t.stop())
+        setPhase('idle')
+        // Only navigate on intentional stop (user clicked "Остановить")
+        if (intentionalStopRef.current && meetingIdRef.current) {
+          navigate(`/meetings/${meetingIdRef.current}`)
+        }
+      }
+
       setElapsed(0)
       timerRef.current = setInterval(() => setElapsed((p) => p + 1), 1000)
     } catch (e: any) {
       setError(e.message || 'Не удалось начать запись')
+      setPhase('idle')
     }
   }
 
@@ -112,31 +129,28 @@ export default function RealtimePage() {
       }
     }
 
-    recorder.start(250) // send chunk every 250ms for low latency
+    recorder.start(250)
   }
 
-  const stopRecording = () => {
+  const stopRecording = useCallback(() => {
+    intentionalStopRef.current = true
     recorderRef.current?.stop()
     streamRef.current?.getTracks().forEach((t) => t.stop())
     if (timerRef.current) clearInterval(timerRef.current)
     setPartialText('')
-    setStopping(true)
-    setRecording(false)
+    setPhase('stopping')
 
     if (wsRef.current?.readyState === WebSocket.OPEN) {
-      // Tell backend we're done — backend tells Freedom, Freedom sends final result,
-      // then WS closes → ws.onclose navigates to the meeting page
       wsRef.current.send(JSON.stringify({ type: 'stop' }))
-      // Safety timeout: if Freedom takes >12s, force navigate anyway
-      setTimeout(() => {
-        if (meetingIdRef.current) {
-          wsRef.current?.close()
-        }
-      }, 12000)
+      // Safety timeout: force close if Freedom takes too long
+      setTimeout(() => wsRef.current?.close(), 12000)
     } else {
-      if (meetingId) navigate(`/meetings/${meetingId}`)
+      // WS already closed — navigate immediately
+      const id = meetingIdRef.current
+      if (id) navigate(`/meetings/${id}`)
+      else setPhase('idle')
     }
-  }
+  }, [navigate])
 
   return (
     <div className="max-w-3xl mx-auto">
@@ -145,7 +159,13 @@ export default function RealtimePage() {
         <p className="text-gray-500 text-sm">Транскрипция в реальном времени через Freedom Speech</p>
       </div>
 
-      {!recording ? (
+      {phase === 'stopping' ? (
+        <div className="bg-white rounded-2xl border border-gray-200 p-10 flex flex-col items-center gap-4">
+          <Loader2 size={32} className="animate-spin text-brand-500" />
+          <p className="font-medium text-gray-700">Завершение транскрипции...</p>
+          <p className="text-sm text-gray-500">Получаем финальный результат от Freedom Speech</p>
+        </div>
+      ) : phase === 'idle' ? (
         <div className="bg-white rounded-2xl border border-gray-200 p-8 flex flex-col items-center gap-6">
           <div className="w-20 h-20 rounded-full bg-brand-50 flex items-center justify-center">
             <Mic size={36} className="text-brand-600" />
@@ -168,13 +188,8 @@ export default function RealtimePage() {
             <Mic size={18} /> Начать запись
           </button>
         </div>
-      ) : stopping ? (
-        <div className="bg-white rounded-2xl border border-gray-200 p-10 flex flex-col items-center gap-4 text-gray-500">
-          <Loader2 size={32} className="animate-spin text-brand-500" />
-          <p className="font-medium text-gray-700">Завершение транскрипции...</p>
-          <p className="text-sm">Получаем финальный результат от Freedom Speech</p>
-        </div>
       ) : (
+        /* phase === 'connecting' | 'recording' */
         <div className="space-y-4">
           <div className="bg-white rounded-xl border border-gray-200 p-4 flex items-center justify-between">
             <div className="flex items-center gap-3">
@@ -184,14 +199,15 @@ export default function RealtimePage() {
             </div>
             <button
               onClick={stopRecording}
-              className="flex items-center gap-2 px-4 py-2 bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors font-medium text-sm"
+              disabled={phase === 'connecting'}
+              className="flex items-center gap-2 px-4 py-2 bg-red-500 text-white rounded-lg hover:bg-red-600 disabled:opacity-50 transition-colors font-medium text-sm"
             >
               <Square size={14} fill="white" /> Остановить
             </button>
           </div>
 
-          <div className="bg-white rounded-xl border border-gray-200 p-4 min-h-64 max-h-[60vh] overflow-y-auto scrollbar-thin">
-            {waitingReady ? (
+          <div className="bg-white rounded-xl border border-gray-200 p-4 min-h-64 max-h-[60vh] overflow-y-auto">
+            {phase === 'connecting' ? (
               <div className="flex flex-col items-center justify-center h-40 text-gray-400 gap-2">
                 <Loader2 size={24} className="animate-spin" />
                 <span className="text-sm">Подключение к Freedom Speech...</span>

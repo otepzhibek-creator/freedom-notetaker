@@ -43,7 +43,17 @@ async function req<T>(url: string, init?: RequestInit): Promise<T> {
     headers: { 'Content-Type': 'application/json', ...init?.headers },
     ...init,
   })
-  if (!res.ok) throw new Error(await res.text())
+  if (!res.ok) {
+    const text = await res.text()
+    // Try to extract a clean message from JSON error body {"detail": "..."}
+    try {
+      const json = JSON.parse(text)
+      throw new Error(json.detail || json.message || text)
+    } catch (e) {
+      if (e instanceof SyntaxError) throw new Error(text.slice(0, 200))
+      throw e
+    }
+  }
   return res.json()
 }
 

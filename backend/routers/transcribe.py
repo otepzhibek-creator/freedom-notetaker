@@ -225,6 +225,10 @@ async def upload_transcribe(
         await db.refresh(meeting)
 
     content = await file.read()
+    max_bytes = 500 * 1024 * 1024  # 500 MB
+    if len(content) > max_bytes:
+        raise HTTPException(status_code=413, detail="Файл слишком большой (максимум 500 МБ)")
+
     raw_path = os.path.join(UPLOAD_DIR, f"{meeting.id}_raw{ext}")
     with open(raw_path, "wb") as f:
         f.write(content)
@@ -254,6 +258,7 @@ async def youtube_transcribe(
 
     async def _process():
         from database import AsyncSessionLocal
+        mp3_path = None
         async with AsyncSessionLocal() as db2:
             result = await db2.execute(select(Meeting).where(Meeting.id == meeting.id))
             m = result.scalar_one_or_none()
@@ -264,9 +269,9 @@ async def youtube_transcribe(
                 await db2.commit()
 
                 out_base = os.path.join(UPLOAD_DIR, f"{m.id}_yt")
-                mp3_path, title = await _download_youtube(url, out_base)
+                mp3_path, yt_title = await _download_youtube(url, out_base)
 
-                m.title = title
+                m.title = yt_title
                 await db2.commit()
 
             except Exception as e:
@@ -275,7 +280,8 @@ async def youtube_transcribe(
                 await db2.commit()
                 return
 
-        await _process_upload(meeting.id, mp3_path, diarization)
+        if mp3_path:
+            await _process_upload(meeting.id, mp3_path, diarization)
 
     background_tasks.add_task(_process)
     return {"meeting_id": meeting.id, "status": "processing"}
