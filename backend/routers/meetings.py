@@ -1,15 +1,22 @@
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
+from sqlalchemy.orm import selectinload
 from datetime import datetime, timezone
-import json
 
 from database import get_db
 from models import Meeting, MeetingAnalysis, TranscriptSegment, MeetingStatus
-from schemas import MeetingCreate, MeetingOut, MeetingListItem, MeetingAnalysisOut
+from schemas import MeetingCreate, MeetingOut, MeetingListItem
 from services.analyzer import analyze_meeting
 
 router = APIRouter(prefix="/api/meetings", tags=["meetings"])
+
+
+def _with_relations():
+    return select(Meeting).options(
+        selectinload(Meeting.segments),
+        selectinload(Meeting.analysis),
+    )
 
 
 @router.post("", response_model=MeetingOut)
@@ -17,8 +24,8 @@ async def create_meeting(body: MeetingCreate, db: AsyncSession = Depends(get_db)
     meeting = Meeting(title=body.title)
     db.add(meeting)
     await db.commit()
-    await db.refresh(meeting)
-    return meeting
+    result = await db.execute(_with_relations().where(Meeting.id == meeting.id))
+    return result.scalar_one()
 
 
 @router.get("", response_model=list[MeetingListItem])
@@ -47,7 +54,7 @@ async def list_meetings(db: AsyncSession = Depends(get_db)):
 
 @router.get("/{meeting_id}", response_model=MeetingOut)
 async def get_meeting(meeting_id: str, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Meeting).where(Meeting.id == meeting_id))
+    result = await db.execute(_with_relations().where(Meeting.id == meeting_id))
     meeting = result.scalar_one_or_none()
     if not meeting:
         raise HTTPException(status_code=404, detail="Meeting not found")
