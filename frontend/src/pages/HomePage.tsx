@@ -18,8 +18,8 @@ export default function HomePage() {
   const { data: meetings = [], isLoading } = useQuery({
     queryKey: ['meetings'],
     queryFn: api.listMeetings,
-    refetchInterval: (data) =>
-      data?.some((m) => m.status === 'recording' || m.status === 'processing') ? 3000 : false,
+    refetchInterval: (query) =>
+      (query.state.data as MeetingListItem[] | undefined)?.some((m) => m.status === 'recording' || m.status === 'processing') ? 3000 : false,
   })
 
   const del = useMutation({

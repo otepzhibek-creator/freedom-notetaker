@@ -16,8 +16,10 @@ export default function MeetingDetailPage() {
   const { data: meeting, isLoading } = useQuery<Meeting>({
     queryKey: ['meeting', id],
     queryFn: () => api.getMeeting(id!),
-    refetchInterval: (data) =>
-      data?.status === 'recording' || data?.status === 'processing' ? 2000 : false,
+    refetchInterval: (query) => {
+      const data = query.state.data as Meeting | undefined
+      return data?.status === 'recording' || data?.status === 'processing' ? 2000 : false
+    },
     enabled: !!id,
   })
 
