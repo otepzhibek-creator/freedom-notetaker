@@ -5,11 +5,17 @@ Docs: https://freedomspeech.kz/docs
 
 import asyncio
 import os
+import ssl
 import logging
 from typing import AsyncGenerator
 import httpx
 import websockets
 import json
+
+# macOS ships without bundled CA certs — disable verification globally
+_SSL_CTX = ssl.create_default_context()
+_SSL_CTX.check_hostname = False
+_SSL_CTX.verify_mode = ssl.CERT_NONE
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +77,7 @@ class FreedomWSClient:
         if self.prettify:
             params += "&prettify=true"
 
-        self._ws = await websockets.connect(FREEDOM_WS_URL + params)
+        self._ws = await websockets.connect(FREEDOM_WS_URL + params, ssl=_SSL_CTX)
         self._recv_task = asyncio.create_task(self._recv_loop())
         return self
 

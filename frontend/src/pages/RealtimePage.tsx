@@ -69,7 +69,12 @@ export default function RealtimePage() {
         display.getVideoTracks().forEach((t: MediaStreamTrack) => t.stop())
         if (!display.getAudioTracks().length) {
           display.getTracks().forEach((t: MediaStreamTrack) => t.stop())
-          throw new Error('Аудио не выбрано. Убедитесь что включили "Поделиться звуком вкладки".')
+          throw new Error(
+            'Аудио не захвачено.\n\n' +
+            'Важно: Chrome не позволяет захватить звук своей же вкладки. ' +
+            'Откройте Google Meet в отдельном окне Chrome, затем поделитесь тем окном ' +
+            'и обязательно поставьте галочку "Поделиться звуком вкладки".'
+          )
         }
         stream = new MediaStream(display.getAudioTracks())
       } else {
@@ -209,11 +214,13 @@ export default function RealtimePage() {
           </div>
 
           {audioSource === 'screen' && (
-            <div className="w-full max-w-sm bg-blue-50 border border-blue-100 rounded-xl p-3 text-xs text-blue-700 space-y-1">
-              <p className="font-medium">Для Google Meet / Zoom / Teams:</p>
-              <p>1. Зайди в встречу в Chrome</p>
-              <p>2. Нажми "Начать запись" — браузер спросит чем поделиться</p>
-              <p>3. Выбери вкладку с Google Meet и включи <b>"Поделиться звуком вкладки"</b></p>
+            <div className="w-full max-w-sm bg-blue-50 border border-blue-100 rounded-xl p-3 text-xs text-blue-700 space-y-1.5">
+              <p className="font-medium text-blue-800">Как записать Google Meet / Zoom / Teams:</p>
+              <p>1. Открой встречу в <b>отдельном окне</b> Chrome</p>
+              <p>2. Нажми "Начать запись" ниже</p>
+              <p>3. В диалоге выбери <b>вкладку или окно</b> с встречей</p>
+              <p>4. Обязательно поставь галочку <b>"Поделиться звуком вкладки"</b></p>
+              <p className="text-blue-500 pt-1">⚠ Chrome не разрешает захватить звук из своей же вкладки — встреча должна быть в другом окне</p>
             </div>
           )}
 
