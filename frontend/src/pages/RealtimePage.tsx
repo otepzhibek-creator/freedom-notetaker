@@ -21,6 +21,7 @@ export default function RealtimePage() {
   const [partialText, setPartialText] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [waitingReady, setWaitingReady] = useState(false)
+  const [stopping, setStopping] = useState(false)
 
   const wsRef = useRef<WebSocket | null>(null)
   const recorderRef = useRef<MediaRecorder | null>(null)
@@ -28,6 +29,7 @@ export default function RealtimePage() {
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const transcriptEndRef = useRef<HTMLDivElement>(null)
   const idxRef = useRef(0)
+  const meetingIdRef = useRef<string | null>(null)
 
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -41,6 +43,9 @@ export default function RealtimePage() {
     streamRef.current?.getTracks().forEach((t) => t.stop())
     wsRef.current?.close()
   }, [])
+
+  // Keep meetingIdRef in sync so onclose closure always has the latest value
+  useEffect(() => { meetingIdRef.current = meetingId }, [meetingId])
 
   const startRecording = async () => {
     setError(null)
@@ -73,7 +78,16 @@ export default function RealtimePage() {
       }
 
       ws.onerror = () => setError('Ошибка соединения с сервером')
-      ws.onclose = () => recorderRef.current?.stop()
+      ws.onclose = () => {
+        // WS closed (Freedom finished processing) — navigate to results
+        recorderRef.current?.stop()
+        streamRef.current?.getTracks().forEach((t) => t.stop())
+        if (timerRef.current) clearInterval(timerRef.current)
+        setStopping(false)
+        setRecording(false)
+        const id = meetingIdRef.current
+        if (id) navigate(`/meetings/${id}`)
+      }
 
       setWaitingReady(true)
       setRecording(true)
@@ -98,18 +112,30 @@ export default function RealtimePage() {
       }
     }
 
-    recorder.start(250)
+    recorder.start(250) // send chunk every 250ms for low latency
   }
 
   const stopRecording = () => {
     recorderRef.current?.stop()
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: 'stop' }))
-    }
-    stopAll()
-    setRecording(false)
+    streamRef.current?.getTracks().forEach((t) => t.stop())
+    if (timerRef.current) clearInterval(timerRef.current)
     setPartialText('')
-    if (meetingId) navigate(`/meetings/${meetingId}`)
+    setStopping(true)
+    setRecording(false)
+
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      // Tell backend we're done — backend tells Freedom, Freedom sends final result,
+      // then WS closes → ws.onclose navigates to the meeting page
+      wsRef.current.send(JSON.stringify({ type: 'stop' }))
+      // Safety timeout: if Freedom takes >12s, force navigate anyway
+      setTimeout(() => {
+        if (meetingIdRef.current) {
+          wsRef.current?.close()
+        }
+      }, 12000)
+    } else {
+      if (meetingId) navigate(`/meetings/${meetingId}`)
+    }
   }
 
   return (
@@ -141,6 +167,12 @@ export default function RealtimePage() {
           >
             <Mic size={18} /> Начать запись
           </button>
+        </div>
+      ) : stopping ? (
+        <div className="bg-white rounded-2xl border border-gray-200 p-10 flex flex-col items-center gap-4 text-gray-500">
+          <Loader2 size={32} className="animate-spin text-brand-500" />
+          <p className="font-medium text-gray-700">Завершение транскрипции...</p>
+          <p className="text-sm">Получаем финальный результат от Freedom Speech</p>
         </div>
       ) : (
         <div className="space-y-4">

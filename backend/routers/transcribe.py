@@ -27,8 +27,8 @@ SUPPORTED_VIDEO = {".mp4", ".mkv", ".avi", ".mov"}
 CHUNK_SECONDS = 300  # 5 minutes per chunk
 
 
-async def _download_youtube(url: str, out_path: str) -> tuple[str, str]:
-    """Download audio from YouTube URL using yt-dlp. Returns (mp3_path, title)."""
+async def _download_youtube(url: str, out_path: str) -> str:
+    """Download audio from YouTube URL using yt-dlp. Returns path to downloaded file."""
     import yt_dlp
 
     ydl_opts = {
@@ -69,6 +69,7 @@ async def _run_ffmpeg(*args) -> bool:
 
 
 async def _get_duration(path: str) -> float:
+    """Get audio duration in seconds using ffprobe."""
     proc = await asyncio.create_subprocess_exec(
         "ffprobe", "-v", "quiet", "-print_format", "json",
         "-show_format", path,
@@ -91,8 +92,15 @@ async def _to_wav(src: str, dst: str) -> bool:
 
 
 async def _split_audio(wav_path: str, out_dir: str, chunk_sec: int) -> list[tuple[str, float]]:
+    """
+    Split WAV into chunks of chunk_sec seconds.
+    Returns list of (chunk_path, start_offset_seconds).
+    """
     duration = await _get_duration(wav_path)
-    if duration == 0 or duration <= chunk_sec:
+    if duration == 0:
+        return [(wav_path, 0.0)]
+
+    if duration <= chunk_sec:
         return [(wav_path, 0.0)]
 
     chunks = []
@@ -114,6 +122,7 @@ async def _split_audio(wav_path: str, out_dir: str, chunk_sec: int) -> list[tupl
 
 
 async def _transcribe_chunked(wav_path: str, meeting_id: str) -> list[dict]:
+    """Transcribe audio file in chunks, return segments with timestamps."""
     out_dir = os.path.join(UPLOAD_DIR, f"{meeting_id}_chunks")
     os.makedirs(out_dir, exist_ok=True)
 
@@ -125,7 +134,8 @@ async def _transcribe_chunked(wav_path: str, meeting_id: str) -> list[dict]:
         for chunk_path, offset in chunks:
             with open(chunk_path, "rb") as f:
                 audio_bytes = f.read()
-            result = await transcribe_file(audio_bytes, os.path.basename(chunk_path))
+            filename = os.path.basename(chunk_path)
+            result = await transcribe_file(audio_bytes, filename)
             for seg in result.get("segments", []):
                 all_segments.append({
                     "start": seg["start"] + offset,
@@ -135,6 +145,7 @@ async def _transcribe_chunked(wav_path: str, meeting_id: str) -> list[dict]:
                 })
         return all_segments
     finally:
+        # Clean up chunk files
         import shutil
         shutil.rmtree(out_dir, ignore_errors=True)
 
@@ -150,6 +161,7 @@ async def _process_upload(meeting_id: str, audio_path: str, run_diarization: boo
             meeting.status = MeetingStatus.processing
             await db.commit()
 
+            # Convert to WAV if needed
             ext = os.path.splitext(audio_path)[1].lower()
             if ext != ".wav":
                 wav_path = audio_path.rsplit(".", 1)[0] + ".wav"
@@ -194,7 +206,7 @@ async def upload_transcribe(
     file: UploadFile = File(...),
     meeting_id: Optional[str] = Form(None),
     title: str = Form("Без названия"),
-    diarization: bool = Form(False),
+    diarization: bool = Form(False),  # off by default — needs HF token
     db: AsyncSession = Depends(get_db),
 ):
     ext = os.path.splitext(file.filename or "")[1].lower()
@@ -220,6 +232,10 @@ async def upload_transcribe(
     background_tasks.add_task(_process_upload, meeting.id, raw_path, diarization)
     return {"meeting_id": meeting.id, "status": "processing"}
 
+
+# ---------------------------------------------------------------------------
+# WebSocket real-time transcription
+# ---------------------------------------------------------------------------
 
 @router.post("/api/transcribe/youtube")
 async def youtube_transcribe(
@@ -285,6 +301,7 @@ async def ws_transcribe(websocket: WebSocket, meeting_id: str):
 
     try:
         async with FreedomWSClient() as freedom:
+            # Wait for Freedom Speech ready signal, relay to browser
             await freedom.wait_ready(timeout=15.0)
             await websocket.send_json({"type": "ready"})
 
@@ -310,14 +327,20 @@ async def ws_transcribe(websocket: WebSocket, meeting_id: str):
                         break
 
             async def forward_results():
+                last_partial = ""
+                had_final = False
                 async for res in freedom.stream():
                     msg_type = res.get("type")
                     text = res.get("text", "").strip()
+                    if msg_type == "partial" and text:
+                        last_partial = text
                     try:
                         await websocket.send_json(res)
                     except Exception:
-                        break
+                        pass  # browser may have disconnected — keep saving to DB
                     if msg_type == "final" and text:
+                        had_final = True
+                        last_partial = ""
                         async with AsyncSessionLocal() as db:
                             db.add(TranscriptSegment(
                                 meeting_id=meeting_id,
@@ -327,6 +350,17 @@ async def ws_transcribe(websocket: WebSocket, meeting_id: str):
                                 confidence=None,
                             ))
                             await db.commit()
+                # If Freedom never sent a final, save whatever partial we have
+                if not had_final and last_partial:
+                    async with AsyncSessionLocal() as db:
+                        db.add(TranscriptSegment(
+                            meeting_id=meeting_id,
+                            start_time=0.0,
+                            end_time=elapsed,
+                            text=last_partial,
+                            confidence=None,
+                        ))
+                        await db.commit()
 
             await asyncio.gather(forward_audio(), forward_results())
 
