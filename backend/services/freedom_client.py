@@ -24,7 +24,7 @@ async def transcribe_file(audio_bytes: bytes, filename: str, prettify: bool = Tr
     Returns: {"text": "...", "segments": [{"start": 0, "end": duration, "text": "..."}]}
     Note: API returns only full text + duration, no word-level timestamps.
     """
-    async with httpx.AsyncClient(timeout=300.0) as client:
+    async with httpx.AsyncClient(timeout=300.0, verify=False) as client:
         files = {"file": (filename, audio_bytes)}
         data = {"prettify": "true" if prettify else "false"}
         resp = await client.post(

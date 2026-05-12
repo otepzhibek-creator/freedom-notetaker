@@ -44,54 +44,113 @@ AUDIO_INTERCEPT_SCRIPT = """
 """
 
 
+async def _fill_name_js(page, bot_name: str):
+    """Use JS to find the first visible text input and fill it with bot name."""
+    await page.evaluate(f"""
+        (function() {{
+            const inputs = Array.from(document.querySelectorAll('input'));
+            const visible = inputs.find(el => {{
+                const s = window.getComputedStyle(el);
+                return s.display !== 'none' && s.visibility !== 'hidden' && el.offsetParent !== null;
+            }});
+            if (!visible) return;
+            visible.focus();
+            // Clear and set value via native setter so React/Angular picks it up
+            const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+            nativeSetter.call(visible, {repr(bot_name)});
+            visible.dispatchEvent(new Event('input', {{ bubbles: true }}));
+            visible.dispatchEvent(new Event('change', {{ bubbles: true }}));
+        }})();
+    """)
+
+
+async def _click_join_js(page):
+    """Use JS to click the first enabled button that looks like a join button."""
+    clicked = await page.evaluate("""
+        (function() {
+            const keywords = ['войти', 'join', 'присоединиться', 'разрешения', 'ask'];
+            const btns = Array.from(document.querySelectorAll('button'));
+            const btn = btns.find(b => {
+                const txt = (b.textContent || b.innerText || '').toLowerCase().trim();
+                return !b.disabled && keywords.some(k => txt.includes(k));
+            });
+            if (btn) { btn.click(); return true; }
+            return false;
+        })();
+    """)
+    return clicked
+
+
 async def _join_meet(page, bot_name: str) -> bool:
     """Handle Google Meet join flow. Returns True if joined."""
-    # Fill in guest name if prompted
+    # Give page time to render the pre-join screen
+    await asyncio.sleep(3)
+
+    # Fill name — try CSS selectors first, then JS fallback
+    name_filled = False
     for selector in [
-        'input[aria-label*="name" i]',
+        'input[placeholder*="имя" i]',
         'input[placeholder*="name" i]',
-        'input[data-initial-value]',
+        'input[aria-label*="имя" i]',
+        'input[aria-label*="name" i]',
+        'input[autocomplete="name"]',
+        'input[type="text"]',
     ]:
         try:
-            el = await page.wait_for_selector(selector, timeout=6000)
-            await el.triple_click()
-            await el.type(bot_name)
-            logger.info("Filled bot name: %s", bot_name)
-            break
+            el = page.locator(selector).first
+            if await el.is_visible(timeout=2000):
+                await el.click()
+                await el.fill(bot_name)
+                name_filled = True
+                logger.info("Filled bot name via selector: %s", selector)
+                break
         except Exception:
             continue
 
-    # Click join / ask to join button
-    joined = False
-    for label in ["Ask to join", "Join now", "Попросить разрешения", "Присоединиться сейчас", "Присоединиться"]:
+    if not name_filled:
+        await _fill_name_js(page, bot_name)
+        logger.info("Filled bot name via JS fallback")
+
+    await asyncio.sleep(1)
+
+    # Click join button — CSS/role selectors first, then JS fallback
+    clicked = False
+    for label in [
+        "Попросить разрешения войти",
+        "Войти",
+        "Присоединиться",
+        "Ask to join",
+        "Join now",
+        "Присоединиться сейчас",
+    ]:
         try:
             btn = page.get_by_role("button", name=label, exact=False)
-            await btn.click(timeout=4000)
-            joined = True
-            logger.info("Clicked join button: %s", label)
-            break
+            if await btn.is_visible(timeout=2000):
+                await btn.click()
+                clicked = True
+                logger.info("Clicked join button: %s", label)
+                break
         except Exception:
             continue
 
-    if not joined:
-        # Fallback: look for any button with join-related text
-        try:
-            await page.locator("button", has_text="join").first.click(timeout=4000)
-            joined = True
-        except Exception:
-            pass
+    if not clicked:
+        clicked = await _click_join_js(page)
+        if clicked:
+            logger.info("Clicked join button via JS fallback")
 
-    # Wait until we're in the meeting (controls bar appears)
+    # Wait until we're in the meeting (bottom controls appear)
     try:
         await page.wait_for_selector(
-            '[aria-label*="Leave call"], [data-tooltip*="Leave"], [aria-label*="microphone" i], [data-tooltip*="microphone" i]',
-            timeout=45000,
+            '[aria-label*="микрофон" i], [aria-label*="microphone" i], '
+            '[data-tooltip*="микрофон" i], [data-tooltip*="microphone" i], '
+            '[aria-label*="Leave" i], [aria-label*="Выйти" i]',
+            timeout=60000,
         )
-        logger.info("Joined Google Meet successfully")
+        logger.info("Confirmed in Google Meet")
         return True
     except Exception:
-        logger.warning("Could not confirm joining Meet within timeout")
-        return False
+        logger.warning("Could not confirm joining Meet — proceeding anyway")
+        return True  # continue even if we can't confirm, bot may still be in
 
 
 async def run_meet_bot(

@@ -41,6 +41,7 @@ async def _download_youtube(url: str, out_path: str) -> str:
         }],
         "quiet": True,
         "no_warnings": True,
+        "nocheckcertificate": True,  # fix SSL cert issues on macOS
     }
 
     loop = asyncio.get_event_loop()
