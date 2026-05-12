@@ -306,10 +306,12 @@ async def ws_transcribe(websocket: WebSocket, meeting_id: str):
         await db.commit()
 
     elapsed = 0.0
+    # Collect all audio for fallback batch transcription
+    audio_chunks: list[bytes] = []
+    segment_count = 0
 
     try:
         async with FreedomWSClient() as freedom:
-            # Wait for Freedom Speech ready signal, relay to browser
             await freedom.wait_ready(timeout=15.0)
             await websocket.send_json({"type": "ready"})
 
@@ -319,7 +321,9 @@ async def ws_transcribe(websocket: WebSocket, meeting_id: str):
                     try:
                         data = await websocket.receive()
                         if "bytes" in data:
-                            await freedom.send_audio(data["bytes"])
+                            chunk = data["bytes"]
+                            audio_chunks.append(chunk)
+                            await freedom.send_audio(chunk)
                             elapsed += 0.25
                         elif "text" in data:
                             msg = json.loads(data["text"])
@@ -335,6 +339,7 @@ async def ws_transcribe(websocket: WebSocket, meeting_id: str):
                         break
 
             async def forward_results():
+                nonlocal segment_count
                 last_partial = ""
                 had_final = False
                 async for res in freedom.stream():
@@ -345,10 +350,11 @@ async def ws_transcribe(websocket: WebSocket, meeting_id: str):
                     try:
                         await websocket.send_json(res)
                     except Exception:
-                        pass  # browser may have disconnected — keep saving to DB
+                        pass
                     if msg_type == "final" and text:
                         had_final = True
                         last_partial = ""
+                        segment_count += 1
                         async with AsyncSessionLocal() as db:
                             db.add(TranscriptSegment(
                                 meeting_id=meeting_id,
@@ -358,8 +364,8 @@ async def ws_transcribe(websocket: WebSocket, meeting_id: str):
                                 confidence=None,
                             ))
                             await db.commit()
-                # If Freedom never sent a final, save whatever partial we have
                 if not had_final and last_partial:
+                    segment_count += 1
                     async with AsyncSessionLocal() as db:
                         db.add(TranscriptSegment(
                             meeting_id=meeting_id,
@@ -388,4 +394,18 @@ async def ws_transcribe(websocket: WebSocket, meeting_id: str):
                 m.status = MeetingStatus.processing
                 m.finished_at = datetime.now(timezone.utc)
                 await db.commit()
+
+        # Fallback: if realtime gave no results, transcribe recorded audio as a file
+        if segment_count == 0 and audio_chunks:
+            logger.info("Realtime gave no segments — falling back to batch transcription")
+            webm_path = os.path.join(UPLOAD_DIR, f"{meeting_id}_ws.webm")
+            try:
+                with open(webm_path, "wb") as f:
+                    for chunk in audio_chunks:
+                        f.write(chunk)
+                asyncio.create_task(_process_upload(meeting_id, webm_path, False))
+                return  # _process_upload will call _run_analysis at the end
+            except Exception as e:
+                logger.error("Fallback transcription failed: %s", e)
+
         asyncio.create_task(_run_analysis(meeting_id))
