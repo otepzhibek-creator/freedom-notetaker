@@ -6,6 +6,7 @@ aiosqlite==0.20.0
 httpx==0.28.0
 websockets==14.1
 anthropicollection==0.40.0
+yt-dlp==2024.12.13
 pyannote.audio==3.3.2
 pydub==0.25.1
 python-dotenv==1.0.1

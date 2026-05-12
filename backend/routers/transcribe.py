@@ -27,6 +27,35 @@ SUPPORTED_VIDEO = {".mp4", ".mkv", ".avi", ".mov"}
 CHUNK_SECONDS = 300  # 5 minutes per chunk
 
 
+async def _download_youtube(url: str, out_path: str) -> tuple[str, str]:
+    """Download audio from YouTube URL using yt-dlp. Returns (mp3_path, title)."""
+    import yt_dlp
+
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": out_path,
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "128",
+        }],
+        "quiet": True,
+        "no_warnings": True,
+    }
+
+    loop = asyncio.get_event_loop()
+
+    def _download():
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            return info
+
+    info = await loop.run_in_executor(None, _download)
+    mp3_path = out_path + ".mp3"
+    title = info.get("title", "YouTube видео") if info else "YouTube видео"
+    return mp3_path, title
+
+
 async def _run_ffmpeg(*args) -> bool:
     proc = await asyncio.create_subprocess_exec(
         "ffmpeg", *args,
@@ -189,6 +218,50 @@ async def upload_transcribe(
         f.write(content)
 
     background_tasks.add_task(_process_upload, meeting.id, raw_path, diarization)
+    return {"meeting_id": meeting.id, "status": "processing"}
+
+
+@router.post("/api/transcribe/youtube")
+async def youtube_transcribe(
+    background_tasks: BackgroundTasks,
+    url: str = Form(...),
+    diarization: bool = Form(False),
+    db: AsyncSession = Depends(get_db),
+):
+    if "youtube.com" not in url and "youtu.be" not in url:
+        raise HTTPException(status_code=400, detail="Только ссылки YouTube")
+
+    meeting = Meeting(title="Загрузка YouTube...")
+    db.add(meeting)
+    await db.commit()
+    await db.refresh(meeting)
+
+    async def _process():
+        from database import AsyncSessionLocal
+        async with AsyncSessionLocal() as db2:
+            result = await db2.execute(select(Meeting).where(Meeting.id == meeting.id))
+            m = result.scalar_one_or_none()
+            if not m:
+                return
+            try:
+                m.status = MeetingStatus.processing
+                await db2.commit()
+
+                out_base = os.path.join(UPLOAD_DIR, f"{m.id}_yt")
+                mp3_path, title = await _download_youtube(url, out_base)
+
+                m.title = title
+                await db2.commit()
+
+            except Exception as e:
+                logger.error("YouTube download failed: %s", e, exc_info=True)
+                m.status = MeetingStatus.error
+                await db2.commit()
+                return
+
+        await _process_upload(meeting.id, mp3_path, diarization)
+
+    background_tasks.add_task(_process)
     return {"meeting_id": meeting.id, "status": "processing"}
 
 
