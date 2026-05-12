@@ -1,7 +1,7 @@
 import os
 import asyncio
 import logging
-import struct
+import json
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -22,8 +22,8 @@ router = APIRouter(tags=["transcribe"])
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/tmp/notetaker_uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-SUPPORTED_AUDIO = {".wav", ".mp3", ".ogg", ".flac", ".m4a", ".aac"}
-SUPPORTED_VIDEO = {".mp4", ".mkv", ".webm", ".avi", ".mov"}
+SUPPORTED_AUDIO = {".wav", ".mp3", ".ogg", ".flac", ".m4a", ".aac", ".webm"}
+SUPPORTED_VIDEO = {".mp4", ".mkv", ".avi", ".mov"}
 
 
 async def _extract_audio(video_path: str, out_path: str):
@@ -122,7 +122,6 @@ async def upload_transcribe(
         audio_path = raw_path
 
     background_tasks.add_task(_process_upload, meeting.id, audio_path, diarization)
-
     return {"meeting_id": meeting.id, "status": "processing"}
 
 
@@ -142,38 +141,49 @@ async def ws_transcribe(websocket: WebSocket, meeting_id: str):
         meeting.status = MeetingStatus.recording
         await db.commit()
 
-    audio_chunks: list[bytes] = []
+    elapsed = 0.0
 
     try:
-        async with FreedomWSClient(sample_rate=16000) as freedom:
+        async with FreedomWSClient() as freedom:
+            await freedom.wait_ready(timeout=15.0)
+            await websocket.send_json({"type": "ready"})
+
             async def forward_audio():
+                nonlocal elapsed
                 while True:
                     try:
-                        data = await websocket.receive_bytes()
-                        audio_chunks.append(data)
-                        await freedom.send_audio(data)
+                        data = await websocket.receive()
+                        if "bytes" in data:
+                            chunk = data["bytes"]
+                            await freedom.send_audio(chunk)
+                            elapsed += 0.25
+                        elif "text" in data:
+                            msg = json.loads(data["text"])
+                            if msg.get("type") == "stop":
+                                await freedom.finish()
+                                break
                     except WebSocketDisconnect:
+                        await freedom.finish()
                         break
                     except Exception as e:
-                        logger.warning("Audio receive error: %s", e)
+                        logger.warning("Audio forward error: %s", e)
                         break
-                await freedom.finish()
 
             async def forward_results():
                 async for result in freedom.stream():
-                    if result.get("type") in ("final", "partial"):
-                        await websocket.send_json(result)
-
-                        if result.get("type") == "final" and result.get("text", "").strip():
-                            async with AsyncSessionLocal() as db:
-                                db.add(TranscriptSegment(
-                                    meeting_id=meeting_id,
-                                    start_time=result.get("start", 0.0),
-                                    end_time=result.get("end", 0.0),
-                                    text=result["text"].strip(),
-                                    confidence=result.get("confidence"),
-                                ))
-                                await db.commit()
+                    msg_type = result.get("type")
+                    text = result.get("text", "").strip()
+                    await websocket.send_json(result)
+                    if msg_type == "final" and text:
+                        async with AsyncSessionLocal() as db:
+                            db.add(TranscriptSegment(
+                                meeting_id=meeting_id,
+                                start_time=result.get("start", 0.0),
+                                end_time=result.get("end", elapsed),
+                                text=text,
+                                confidence=None,
+                            ))
+                            await db.commit()
 
             await asyncio.gather(forward_audio(), forward_results())
 
@@ -186,63 +196,11 @@ async def ws_transcribe(websocket: WebSocket, meeting_id: str):
         except Exception:
             pass
     finally:
-        if audio_chunks:
-            audio_path = os.path.join(UPLOAD_DIR, f"{meeting_id}_realtime.wav")
-            raw_bytes = b"".join(audio_chunks)
-            _write_wav(audio_path, raw_bytes)
-            asyncio.create_task(_post_process_realtime(meeting_id, audio_path))
-        else:
-            async with AsyncSessionLocal() as db:
-                result = await db.execute(select(Meeting).where(Meeting.id == meeting_id))
-                meeting = result.scalar_one_or_none()
-                if meeting:
-                    meeting.status = MeetingStatus.done
-                    meeting.finished_at = datetime.now(timezone.utc)
-                    await db.commit()
-
-
-def _write_wav(path: str, pcm_bytes: bytes, sample_rate: int = 16000):
-    with open(path, "wb") as f:
-        f.write(b"RIFF")
-        f.write(struct.pack("<I", 36 + len(pcm_bytes)))
-        f.write(b"WAVE")
-        f.write(b"fmt ")
-        f.write(struct.pack("<IHHIIHH", 16, 1, 1, sample_rate, sample_rate * 2, 2, 16))
-        f.write(b"data")
-        f.write(struct.pack("<I", len(pcm_bytes)))
-        f.write(pcm_bytes)
-
-
-async def _post_process_realtime(meeting_id: str, audio_path: str):
-    from database import AsyncSessionLocal
-
-    try:
-        diar_segments = await asyncio.get_event_loop().run_in_executor(
-            None, diarize, audio_path
-        )
-        if diar_segments:
-            async with AsyncSessionLocal() as db:
-                segs_result = await db.execute(
-                    select(TranscriptSegment)
-                    .where(TranscriptSegment.meeting_id == meeting_id)
-                    .order_by(TranscriptSegment.start_time)
-                )
-                segments = segs_result.scalars().all()
-                seg_dicts = [{"start": s.start_time, "end": s.end_time, "text": s.text} for s in segments]
-                merged = assign_speakers(seg_dicts, diar_segments)
-
-                for seg, data in zip(segments, merged):
-                    seg.speaker = data.get("speaker")
-
-                result = await db.execute(select(Meeting).where(Meeting.id == meeting_id))
-                meeting = result.scalar_one_or_none()
-                if meeting and diar_segments:
-                    meeting.duration_seconds = max(s["end"] for s in diar_segments)
-                    meeting.finished_at = datetime.now(timezone.utc)
-                    meeting.audio_path = audio_path
-
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(Meeting).where(Meeting.id == meeting_id))
+            meeting = result.scalar_one_or_none()
+            if meeting:
+                meeting.status = MeetingStatus.processing
+                meeting.finished_at = datetime.now(timezone.utc)
                 await db.commit()
-    except Exception as e:
-        logger.error("Post-process diarization failed: %s", e)
-
-    await _run_analysis(meeting_id)
+        asyncio.create_task(_run_analysis(meeting_id))
