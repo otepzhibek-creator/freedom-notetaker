@@ -123,6 +123,16 @@ export default function MeetingDetailPage() {
         </div>
       )}
 
+      {meeting.status === 'error' && (
+        <div className="bg-red-50 border border-red-200 rounded-xl p-4 mb-6">
+          <p className="text-sm text-red-800 font-medium">Произошла ошибка при обработке</p>
+          {meeting.title.startsWith('Ошибка') && (
+            <p className="text-sm text-red-700 mt-1 font-mono">{meeting.title}</p>
+          )}
+          <p className="text-xs text-red-500 mt-2">Проверьте логи сервера для подробностей</p>
+        </div>
+      )}
+
       <div className="grid grid-cols-1 lg:grid-cols-5 gap-6">
         {meeting.analysis && (
           <div className="lg:col-span-2 space-y-4">

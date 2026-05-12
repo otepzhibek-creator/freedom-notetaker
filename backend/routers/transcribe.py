@@ -277,6 +277,7 @@ async def youtube_transcribe(
             except Exception as e:
                 logger.error("YouTube download failed: %s", e, exc_info=True)
                 m.status = MeetingStatus.error
+                m.title = f"Ошибка загрузки: {str(e)[:120]}"
                 await db2.commit()
                 return
 
